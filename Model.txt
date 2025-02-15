@@ -1,0 +1,235 @@
+import math
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+
+class CyberBERT(nn.Module):
+    def __init__(self, vocab_size, d_model=768, n_heads=12, n_layers=6, d_ff=3072, maxlen=512):
+        super(CyberBERT, self).__init__()
+        self.embedding = Embedding(vocab_size, d_model, maxlen)
+        self.layers = nn.ModuleList([TransformerBlock(d_model, n_heads, d_ff) for _ in range(n_layers)])
+        self.classifier = nn.Linear(d_model, num_classes)
+        
+    def forward(self, input_ids, attention_mask):
+        x = self.embedding(input_ids)
+        for layer in self.layers:
+            x = layer(x, attention_mask)
+        cls_output = x[:, 0]  # CLS token for classification
+        return self.classifier(cls_output)
+
+class Embedding(nn.Module):
+    def __init__(self, vocab_size, d_model, maxlen):
+        super(Embedding, self).__init__()
+        self.token_embed = nn.Embedding(vocab_size, d_model)
+        self.pos_embed = nn.Embedding(maxlen, d_model)
+        self.norm = nn.LayerNorm(d_model)
+        
+    def forward(self, x):
+        seq_len = x.size(1)
+        pos = torch.arange(seq_len, dtype=torch.long, device=x.device).unsqueeze(0)
+        return self.norm(self.token_embed(x) + self.pos_embed(pos))
+
+class TransformerBlock(nn.Module):
+    def __init__(self, d_model, n_heads, d_ff):
+        super(TransformerBlock, self).__init__()
+        self.attention = MultiHeadAttention(d_model, n_heads)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.ffn = FeedForward(d_model, d_ff)
+        self.norm2 = nn.LayerNorm(d_model)
+    
+    def forward(self, x, attn_mask):
+        attn_output = self.attention(x, x, x, attn_mask)
+        x = self.norm1(attn_output + x)
+        ffn_output = self.ffn(x)
+        return self.norm2(ffn_output + x)
+
+class MultiHeadAttention(nn.Module):
+    def __init__(self, d_model, n_heads):
+        super(MultiHeadAttention, self).__init__()
+        self.n_heads = n_heads
+        self.d_k = d_model // n_heads
+        self.qkv_proj = nn.Linear(d_model, d_model * 3)
+        self.output_proj = nn.Linear(d_model, d_model)
+    
+    def forward(self, q, k, v, mask):
+        batch_size = q.size(0)
+        qkv = self.qkv_proj(q).chunk(3, dim=-1)
+        q, k, v = [x.view(batch_size, -1, self.n_heads, self.d_k).transpose(1, 2) for x in qkv]
+        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.d_k)
+        if mask is not None:
+            scores = scores.masked_fill(mask, -1e9)
+        attn_weights = torch.nn.functional.softmax(scores, dim=-1)
+        attn_output = torch.matmul(attn_weights, v).transpose(1, 2).contiguous().view(batch_size, -1, self.n_heads * self.d_k)
+        return self.output_proj(attn_output)
+
+class FeedForward(nn.Module):
+    def __init__(self, d_model, d_ff):
+        super(FeedForward, self).__init__()
+        self.linear1 = nn.Linear(d_model, d_ff)
+        self.linear2 = nn.Linear(d_ff, d_model)
+        self.activation = nn.GELU()
+    
+    def forward(self, x):
+        return self.linear2(self.activation(self.linear1(x)))
+
+# Model Initialization Example
+vocab_size = 30522  # Adjust based on actual dataset
+num_classes = 10  # Adjust based on classification categories
+model = CyberBERT(vocab_size)
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.Adam(model.parameters(), lr=1e-4)
+
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+from collections import Counter
+import itertools
+
+# Hyperparameters
+maxlen = 128  # Max token length
+batch_size = 32
+max_pred = 10  # Maximum masked tokens
+n_layers = 6  # Number of Transformer layers
+n_heads = 8  # Number of attention heads
+d_model = 512  # Embedding size
+d_ff = 2048  # Feedforward layer size
+d_k = d_v = 64  # Key and value dimension
+vocab_size = 5000  # Custom vocabulary size based on WordPiece Tokenizer
+n_classes = 10  # Number of categories to classify
+
+# WordPiece Tokenizer Implementation
+class WordPieceTokenizer:
+    def __init__(self, vocab_size=5000):
+        self.vocab_size = vocab_size
+        self.vocab = {}
+        self.merges = {}
+    
+    def train(self, corpus):
+        word_freq = Counter(itertools.chain(*[sentence.split() for sentence in corpus]))
+        vocab = {word: list(word) + ["</w>"] for word in word_freq}  # </w> marks word boundary
+        merges = {}
+        
+        while len(vocab) < self.vocab_size:
+            bigram_counts = Counter()
+            for word, symbols in vocab.items():
+                for i in range(len(symbols) - 1):
+                    bigram_counts[(symbols[i], symbols[i + 1])] += word_freq[word]
+            
+            if not bigram_counts:
+                break
+            
+            best_pair = max(bigram_counts, key=bigram_counts.get)
+            merges[best_pair] = "".join(best_pair)
+            
+            for word in vocab:
+                vocab[word] = self.merge_tokens(vocab[word], best_pair)
+        
+        self.vocab = {word: i for i, word in enumerate(set(sum(vocab.values(), [])))}
+        self.merges = merges
+    
+    def merge_tokens(self, token_list, merge_pair):
+        i = 0
+        while i < len(token_list) - 1:
+            if (token_list[i], token_list[i + 1]) == merge_pair:
+                token_list = token_list[:i] + ["".join(merge_pair)] + token_list[i + 2:]
+            else:
+                i += 1
+        return token_list
+    
+    def tokenize(self, text):
+        words = text.split()
+        tokenized_output = []
+        for word in words:
+            subwords = list(word)
+            for merge_pair, merge_token in self.merges.items():
+                subwords = self.merge_tokens(subwords, merge_pair)
+            tokenized_output.extend(subwords if subwords else ["[UNK]"])
+        return tokenized_output
+
+    def convert_tokens_to_ids(self, tokens):
+        return [self.vocab.get(token, self.vocab.get("[UNK]", -1)) for token in tokens]
+
+# Tokenizer Training (Assuming corpus is available)
+tokenizer = WordPieceTokenizer(vocab_size=vocab_size)
+# tokenizer.train(corpus)  # Uncomment and provide `corpus` when training
+
+def preprocess_text(text):
+    tokens = tokenizer.tokenize(text)
+    token_ids = tokenizer.convert_tokens_to_ids(tokens)
+    return torch.tensor(token_ids, dtype=torch.long).unsqueeze(0)  # Add batch dimension
+
+class CybercrimeBERT(nn.Module):
+    def __init__(self):
+        super(CybercrimeBERT, self).__init__()
+        self.embedding = nn.Embedding(vocab_size, d_model)
+        self.positional_encoding = nn.Embedding(maxlen, d_model)
+        self.segment_embedding = nn.Embedding(2, d_model)
+        self.layers = nn.ModuleList([TransformerBlock() for _ in range(n_layers)])
+        self.fc = nn.Linear(d_model, n_classes)
+
+    def forward(self, x, seg):
+        seq_len = x.size(1)
+        pos = torch.arange(seq_len, dtype=torch.long, device=x.device)
+        pos = pos.unsqueeze(0).expand_as(x)
+        
+        x = self.embedding(x) + self.positional_encoding(pos) + self.segment_embedding(seg)
+        attn_mask = (x == 0).unsqueeze(1).expand(-1, seq_len, seq_len)
+        
+        for layer in self.layers:
+            x = layer(x, attn_mask)
+        
+        x = x[:, 0]  # Use [CLS] token output
+        return self.fc(x)
+
+class TransformerBlock(nn.Module):
+    def __init__(self):
+        super(TransformerBlock, self).__init__()
+        self.attention = MultiHeadAttention()
+        self.norm1 = nn.LayerNorm(d_model)
+        self.ffn = FeedForward()
+        self.norm2 = nn.LayerNorm(d_model)
+
+    def forward(self, x, attn_mask):
+        attn_out = self.attention(x, x, x, attn_mask)
+        x = self.norm1(x + attn_out)
+        ffn_out = self.ffn(x)
+        return self.norm2(x + ffn_out)
+
+class MultiHeadAttention(nn.Module):
+    def __init__(self):
+        super(MultiHeadAttention, self).__init__()
+        self.qkv_linear = nn.Linear(d_model, d_k * n_heads * 3)
+        self.fc = nn.Linear(d_k * n_heads, d_model)
+
+    def forward(self, q, k, v, attn_mask):
+        batch_size = q.size(0)
+        qkv = self.qkv_linear(q).view(batch_size, -1, n_heads, 3 * d_k).chunk(3, dim=-1)
+        q, k, v = [x.transpose(1, 2) for x in qkv]
+        
+        scores = torch.matmul(q, k.transpose(-2, -1)) / np.sqrt(d_k)
+        scores.masked_fill_(attn_mask, -1e9)
+        attn = torch.softmax(scores, dim=-1)
+        context = torch.matmul(attn, v).transpose(1, 2).reshape(batch_size, -1, d_k * n_heads)
+        return self.fc(context)
+
+class FeedForward(nn.Module):
+    def __init__(self):
+        super(FeedForward, self).__init__()
+        self.fc1 = nn.Linear(d_model, d_ff)
+        self.fc2 = nn.Linear(d_ff, d_model)
+
+    def forward(self, x):
+        return self.fc2(torch.relu(self.fc1(x)))
+
+# Model Initialization
+model = CybercrimeBERT()
+optimizer = optim.Adam(model.parameters(), lr=0.0001)
+criterion = nn.CrossEntropyLoss()
+
+# Training Loop Placeholder (to be completed)
+def train():
+    pass  # Will implement batch preparation and training logic
+
