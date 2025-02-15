@@ -1,0 +1,115 @@
+import polars as pl
+import matplotlib.pyplot as plt
+from wordcloud import WordCloud
+from collections import Counter
+import seaborn as sns
+import numpy as np
+
+# Load dataset
+df = pl.read_csv("your_dataset.csv")  # Update with actual path
+
+# Basic Data Overview
+print("Dataset Shape:", df.shape)
+print("Column Names:", df.columns)
+print("Missing Values:")
+print(df.null_count())
+print("Duplicate Rows:", df.is_duplicated().sum())
+
+# Convert categorical columns
+df = df.with_columns(
+    pl.col("Category").cast(pl.Categorical),
+    pl.col("Sub-category").cast(pl.Categorical)
+)
+
+# Description Length Analysis
+df = df.with_columns(
+    pl.col("Description").str.len_chars().alias("description_length"),
+    pl.col("Description").str.len_bytes().alias("description_bytes"),
+    pl.col("Description").str.n_chars().alias("word_count")
+)
+
+# Plot distribution of description lengths
+plt.figure(figsize=(10, 5))
+sns.histplot(df["description_length"].to_list(), bins=50, kde=True)
+plt.title("Distribution of Description Lengths")
+plt.xlabel("Number of Characters")
+plt.ylabel("Frequency")
+plt.show()
+
+# Word Frequency Analysis
+def get_word_counts(texts):
+    words = " ".join(texts).lower().split()
+    return Counter(words)
+
+word_counts = get_word_counts(df["Description"].drop_nulls().to_list())
+
+# Word Cloud
+wordcloud = WordCloud(width=800, height=400, background_color='white').generate_from_frequencies(word_counts)
+plt.figure(figsize=(10, 5))
+plt.imshow(wordcloud, interpolation='bilinear')
+plt.axis("off")
+plt.show()
+
+# Category Distribution
+plt.figure(figsize=(12, 6))
+sns.countplot(y=df["Category"].to_list(), order=df["Category"].value_counts().keys(), palette="viridis")
+plt.title("Category Distribution")
+plt.xlabel("Count")
+plt.ylabel("Category")
+plt.show()
+
+# Sub-Category Distribution
+plt.figure(figsize=(12, 6))
+sns.countplot(y=df["Sub-category"].to_list(), order=df["Sub-category"].value_counts().keys(), palette="coolwarm")
+plt.title("Sub-category Distribution")
+plt.xlabel("Count")
+plt.ylabel("Sub-category")
+plt.show()
+
+# Category vs. Description Length
+plt.figure(figsize=(12, 6))
+sns.boxplot(x=df["Category"].to_list(), y=df["description_length"].to_list())
+plt.xticks(rotation=45)
+plt.title("Description Length by Category")
+plt.xlabel("Category")
+plt.ylabel("Description Length")
+plt.show()
+
+# Correlation Between Categories and Sub-categories
+category_subcategory_counts = df.groupby(["Category", "Sub-category"]).count().sort(by="count", descending=True)
+print(category_subcategory_counts)
+
+# Checking for Most Common Bigrams (Two-word phrases)
+def get_bigrams(texts):
+    bigrams = Counter()
+    for text in texts:
+        words = text.lower().split()
+        bigrams.update([(words[i], words[i+1]) for i in range(len(words)-1)])
+    return bigrams
+
+bigrams = get_bigrams(df["Description"].drop_nulls().to_list())
+print("Most Common Bigrams:", bigrams.most_common(10))
+
+# Word Count Distribution per Category
+plt.figure(figsize=(12, 6))
+sns.boxplot(x=df["Category"].to_list(), y=df["word_count"].to_list())
+plt.xticks(rotation=45)
+plt.title("Word Count Distribution per Category")
+plt.xlabel("Category")
+plt.ylabel("Word Count")
+plt.show()
+
+# Missing Value Heatmap
+plt.figure(figsize=(10, 5))
+sns.heatmap(df.is_null().to_pandas(), cmap="viridis", cbar=False)
+plt.title("Missing Value Heatmap")
+plt.show()
+
+# Outlier Detection in Description Length
+q1 = np.percentile(df["description_length"].to_list(), 25)
+q3 = np.percentile(df["description_length"].to_list(), 75)
+iqr = q3 - q1
+lower_bound = q1 - 1.5 * iqr
+upper_bound = q3 + 1.5 * iqr
+outliers = df.filter((pl.col("description_length") < lower_bound) | (pl.col("description_length") > upper_bound))
+print("Outliers in Description Length:", outliers.shape[0])
