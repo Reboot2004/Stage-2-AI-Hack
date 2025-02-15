@@ -1,0 +1,361 @@
+import polars as pl
+import matplotlib.pyplot as plt
+from wordcloud import WordCloud
+from collections import Counter
+import seaborn as sns
+import numpy as np
+import re
+import nltk
+from nltk.corpus import stopwords
+from nltk.stem import PorterStemmer, WordNetLemmatizer
+import itertools
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+
+# ---------------------------
+# EDA & Preprocessing
+# ---------------------------
+# Download necessary NLTK data
+nltk.download('stopwords')
+nltk.download('wordnet')
+nltk.download('omw-1.4')
+
+# Load dataset
+df = pl.read_csv("your_dataset.csv")  # Update with actual path
+
+# Basic Data Overview
+print("Dataset Shape:", df.shape)
+print("Column Names:", df.columns)
+print("Missing Values:")
+print(df.null_count())
+print("Duplicate Rows:", df.filter(df.is_duplicated()).shape[0])
+
+# Convert categorical columns
+df = df.with_columns(
+    pl.col("Category").cast(pl.Categorical),
+    pl.col("Sub-category").cast(pl.Categorical)
+)
+
+# Initialize NLTK utilities
+STOPWORDS = set(stopwords.words('english'))
+stemmer = PorterStemmer()
+lemmatizer = WordNetLemmatizer()
+
+# Text Preprocessing Functions
+def clean_text(text):
+    text = text.lower()
+    text = re.sub(r'[^a-zA-Z0-9\s]', '', text)  # Remove special characters
+    return text
+
+def remove_stopwords(text):
+    return " ".join([word for word in text.split() if word not in STOPWORDS])
+
+def stem_text(text):
+    return " ".join([stemmer.stem(word) for word in text.split()])
+
+def lemmatize_text(text):
+    return " ".join([lemmatizer.lemmatize(word) for word in text.split()])
+
+# Apply Preprocessing
+df = df.filter(pl.col("Description").is_not_null()).with_columns(
+    pl.col("Description").map_elements(clean_text).alias("cleaned_description")
+)
+df = df.with_columns(
+    pl.col("cleaned_description").map_elements(remove_stopwords).alias("no_stopwords_description")
+)
+df = df.with_columns(
+    pl.col("no_stopwords_description").apply(stem_text).alias("stemmed_description"),
+    pl.col("no_stopwords_description").apply(lemmatize_text).alias("lemmatized_description")
+)
+
+# Description Length Analysis
+df = df.with_columns(
+    pl.col("cleaned_description").str.len_chars().alias("description_length"),
+    pl.col("cleaned_description").str.len_bytes().alias("description_bytes"),
+    pl.col("cleaned_description").str.n_chars().alias("word_count")
+)
+
+# Plot distribution of description lengths
+plt.figure(figsize=(10, 5))
+sns.histplot(df["description_length"].to_list(), bins=50, kde=True)
+plt.title("Distribution of Description Lengths")
+plt.xlabel("Number of Characters")
+plt.ylabel("Frequency")
+plt.show()
+
+# Word Frequency Analysis
+def get_word_counts(texts):
+    words = " ".join(texts).lower().split()
+    return Counter(words)
+
+word_counts = get_word_counts(df["cleaned_description"].drop_nulls().to_list())
+
+# Word Cloud
+wordcloud = WordCloud(width=800, height=400, background_color='white').generate_from_frequencies(word_counts)
+plt.figure(figsize=(10, 5))
+plt.imshow(wordcloud, interpolation='bilinear')
+plt.axis("off")
+plt.show()
+
+# Category Distribution
+plt.figure(figsize=(12, 6))
+sns.countplot(y=df["Category"].to_list(), order=df["Category"].value_counts().keys(), palette="viridis")
+plt.title("Category Distribution")
+plt.xlabel("Count")
+plt.ylabel("Category")
+plt.show()
+
+# Sub-Category Distribution
+plt.figure(figsize=(12, 6))
+sns.countplot(y=df["Sub-category"].to_list(), order=df["Sub-category"].value_counts().keys(), palette="coolwarm")
+plt.title("Sub-category Distribution")
+plt.xlabel("Count")
+plt.ylabel("Sub-category")
+plt.show()
+
+# Category vs. Description Length
+plt.figure(figsize=(12, 6))
+sns.boxplot(x=df["Category"].to_list(), y=df["description_length"].to_list())
+plt.xticks(rotation=45)
+plt.title("Description Length by Category")
+plt.xlabel("Category")
+plt.ylabel("Description Length")
+plt.show()
+
+# Correlation Between Categories and Sub-categories
+category_subcategory_counts = df.groupby(["Category", "Sub-category"]).count().sort(by="count", descending=True)
+print(category_subcategory_counts)
+
+# Checking for Most Common Bigrams
+def get_bigrams(texts):
+    bigrams = Counter()
+    for text in texts:
+        words = text.lower().split()
+        bigrams.update([(words[i], words[i+1]) for i in range(len(words)-1)])
+    return bigrams
+
+bigrams = get_bigrams(df["cleaned_description"].drop_nulls().to_list())
+print("Most Common Bigrams:", bigrams.most_common(10))
+
+# Word Count Distribution per Category
+plt.figure(figsize=(12, 6))
+sns.boxplot(x=df["Category"].to_list(), y=df["word_count"].to_list())
+plt.xticks(rotation=45)
+plt.title("Word Count Distribution per Category")
+plt.xlabel("Category")
+plt.ylabel("Word Count")
+plt.show()
+
+# Missing Value Heatmap
+plt.figure(figsize=(10, 5))
+sns.heatmap(df.null_count().to_pandas().T, cmap="viridis", cbar=False, annot=True)
+plt.title("Missing Value Heatmap")
+plt.show()
+
+# Outlier Detection in Description Length
+q1 = np.percentile(df["description_length"].to_list(), 25)
+q3 = np.percentile(df["description_length"].to_list(), 75)
+iqr = q3 - q1
+lower_bound = q1 - 1.5 * iqr
+upper_bound = q3 + 1.5 * iqr
+outliers = df.filter((pl.col("description_length") < lower_bound) | (pl.col("description_length") > upper_bound))
+print("Outliers in Description Length:", outliers.shape[0])
+
+# For training, we'll use the 'cleaned_description' field and use 'Category' as the label.
+# Convert Category to numeric codes.
+df = df.with_columns(pl.col("Category").cat.codes().alias("label"))
+
+# ---------------------------
+# Custom WordPiece Tokenizer
+# ---------------------------
+class WordPieceTokenizer:
+    def __init__(self, vocab_size=5000):
+        self.vocab_size = vocab_size
+        self.vocab = {}
+        self.merges = {}
+    
+    def train(self, corpus):
+        word_freq = Counter(itertools.chain(*[sentence.split() for sentence in corpus]))
+        vocab = {word: list(word) + ["</w>"] for word in word_freq}  # </w> marks word boundary
+        merges = {}
+        
+        while len(vocab) < self.vocab_size:
+            bigram_counts = Counter()
+            for word, symbols in vocab.items():
+                for i in range(len(symbols) - 1):
+                    bigram_counts[(symbols[i], symbols[i + 1])] += word_freq[word]
+            if not bigram_counts:
+                break
+            best_pair = max(bigram_counts, key=bigram_counts.get)
+            merges[best_pair] = "".join(best_pair)
+            for word in vocab:
+                vocab[word] = self.merge_tokens(vocab[word], best_pair)
+        
+        self.vocab = {word: i for i, word in enumerate(set(sum(vocab.values(), [])))} 
+        self.merges = merges
+    
+    def merge_tokens(self, token_list, merge_pair):
+        i = 0
+        while i < len(token_list) - 1:
+            if (token_list[i], token_list[i + 1]) == merge_pair:
+                token_list = token_list[:i] + ["".join(merge_pair)] + token_list[i + 2:]
+            else:
+                i += 1
+        return token_list
+    
+    def tokenize(self, text):
+        words = text.split()
+        tokenized_output = []
+        for word in words:
+            subwords = list(word)
+            for merge_pair, merge_token in self.merges.items():
+                subwords = self.merge_tokens(subwords, merge_pair)
+            tokenized_output.extend(subwords if subwords else ["[UNK]"])
+        return tokenized_output
+
+    def convert_tokens_to_ids(self, tokens):
+        return [self.vocab.get(token, self.vocab.get("[UNK]", -1)) for token in tokens]
+
+# Initialize and train tokenizer using the corpus of cleaned descriptions
+tokenizer = WordPieceTokenizer(vocab_size=5000)
+corpus = df["cleaned_description"].drop_nulls().to_list()
+tokenizer.train(corpus)
+
+def preprocess_text(text):
+    tokens = tokenizer.tokenize(text)
+    token_ids = tokenizer.convert_tokens_to_ids(tokens)
+    if len(token_ids) < maxlen:
+        token_ids += [0] * (maxlen - len(token_ids))
+    else:
+        token_ids = token_ids[:maxlen]
+    return torch.tensor(token_ids, dtype=torch.long)
+
+# ---------------------------
+# Custom BERT Model for Cybercrime Classification
+# ---------------------------
+class CybercrimeBERT(nn.Module):
+    def __init__(self):
+        super(CybercrimeBERT, self).__init__()        
+        self.embedding = nn.Embedding(5000, d_model)  # Use tokenizer vocab size
+        self.positional_encoding = nn.Embedding(maxlen, d_model)
+        self.segment_embedding = nn.Embedding(2, d_model)
+        self.layers = nn.ModuleList([TransformerBlock() for _ in range(n_layers)])
+        self.fc = nn.Linear(d_model, n_classes)
+        
+    def forward(self, x, seg):
+        seq_len = x.size(1)
+        pos = torch.arange(seq_len, dtype=torch.long, device=x.device).unsqueeze(0).expand_as(x)
+        x = self.embedding(x) + self.positional_encoding(pos) + self.segment_embedding(seg)
+        attn_mask = (x.sum(dim=-1) == 0).unsqueeze(1).expand(-1, seq_len, seq_len)
+        for layer in self.layers:
+            x = layer(x, attn_mask)
+        x = x[:, 0]  # Use [CLS] token output
+        return self.fc(x)
+    
+class TransformerBlock(nn.Module):
+    def __init__(self):
+        super(TransformerBlock, self).__init__()        
+        self.attention = MultiHeadAttention()
+        self.norm1 = nn.LayerNorm(d_model)
+        self.ffn = FeedForward()
+        self.norm2 = nn.LayerNorm(d_model)
+        
+    def forward(self, x, attn_mask):
+        attn_out = self.attention(x, x, x, attn_mask)
+        x = self.norm1(x + attn_out)
+        ffn_out = self.ffn(x)
+        return self.norm2(x + ffn_out)
+    
+class MultiHeadAttention(nn.Module):
+    def __init__(self):
+        super(MultiHeadAttention, self).__init__()        
+        self.qkv_linear = nn.Linear(d_model, d_k * n_heads * 3)
+        self.fc = nn.Linear(d_k * n_heads, d_model)
+        
+    def forward(self, q, k, v, attn_mask):
+        batch_size = q.size(0)
+        qkv = self.qkv_linear(q).view(batch_size, -1, n_heads, 3 * d_k).chunk(3, dim=-1)
+        q, k, v = [x.transpose(1, 2) for x in qkv]
+        scores = torch.matmul(q, k.transpose(-2, -1)) / np.sqrt(d_k)
+        scores.masked_fill_(attn_mask, -1e9)
+        attn = torch.softmax(scores, dim=-1)
+        context = torch.matmul(attn, v).transpose(1, 2).reshape(batch_size, -1, d_k * n_heads)
+        return self.fc(context)
+    
+class FeedForward(nn.Module):
+    def __init__(self):
+        super(FeedForward, self).__init__()        
+        self.fc1 = nn.Linear(d_model, d_ff)
+        self.fc2 = nn.Linear(d_ff, d_model)
+        
+    def forward(self, x):
+        return self.fc2(torch.relu(self.fc1(x)))
+    
+# ---------------------------
+# PyTorch Dataset & DataLoader
+# ---------------------------
+class CybercrimeDataset(Dataset):
+    def __init__(self, df):
+        self.descriptions = df["cleaned_description"].to_list()
+        self.labels = df["label"].to_list()
+        
+    def __len__(self):
+        return len(self.descriptions)
+    
+    def __getitem__(self, idx):
+        text = self.descriptions[idx]
+        input_ids = preprocess_text(text)
+        if input_ids.size(0) < maxlen:
+            padding = torch.zeros(maxlen - input_ids.size(0), dtype=torch.long)
+            input_ids = torch.cat((input_ids, padding), dim=0)
+        else:
+            input_ids = input_ids[:maxlen]
+        seg_ids = torch.zeros(maxlen, dtype=torch.long)  # All tokens as segment 0
+        label = torch.tensor(self.labels[idx], dtype=torch.long)
+        return input_ids, seg_ids, label
+
+dataset = CybercrimeDataset(df)
+dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+# ---------------------------
+# Model Initialization, Optimizer & Loss
+# ---------------------------
+model = CybercrimeBERT()
+optimizer = optim.Adam(model.parameters(), lr=0.0001)
+criterion = nn.CrossEntropyLoss()
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+model.to(device)
+
+# ---------------------------
+# Training Loop
+# ---------------------------
+def train(model, dataloader, epochs=5):
+    model.train()
+    for epoch in range(epochs):
+        total_loss = 0
+        for input_ids, seg_ids, labels in dataloader:
+            input_ids, seg_ids, labels = input_ids.to(device), seg_ids.to(device), labels.to(device)
+            outputs = model(input_ids, seg_ids)
+            loss = criterion(outputs, labels)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+        print(f\"Epoch {epoch+1}/{epochs}, Loss: {total_loss/len(dataloader):.4f}\")
+        
+train(model, dataloader, epochs=5)
+
+# ---------------------------
+# Example Inference
+# ---------------------------
+example_text = "Cybercrime fraud detection system report sample"
+input_ids = preprocess_text(example_text).unsqueeze(0).to(device)  # add batch dim
+seg_ids = torch.zeros((1, maxlen), dtype=torch.long).to(device)
+model.eval()
+with torch.no_grad():
+    outputs = model(input_ids, seg_ids)
+    predicted_class = torch.argmax(outputs, dim=1).item()
+    print(f"Predicted Class: {predicted_class}")

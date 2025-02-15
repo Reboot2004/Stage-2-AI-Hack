@@ -1,0 +1,388 @@
+import polars as pl
+import matplotlib.pyplot as plt
+from wordcloud import WordCloud
+from collections import Counter
+import seaborn as sns
+import numpy as np
+import re
+import nltk
+from nltk.corpus import stopwords
+from nltk.stem import PorterStemmer, WordNetLemmatizer
+import itertools
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+
+# ---------------------------
+# EDA & Preprocessing
+# ---------------------------
+# Download necessary NLTK data
+nltk.download('stopwords')
+nltk.download('wordnet')
+nltk.download('omw-1.4')
+
+# Load dataset (update the path accordingly)
+df = pl.read_csv("your_dataset.csv")
+
+# Basic Data Overview
+print("Dataset Shape:", df.shape)
+print("Column Names:", df.columns)
+print("Missing Values:")
+print(df.null_count())
+print("Duplicate Rows:", df.filter(df.is_duplicated()).shape[0])
+
+# Convert categorical columns (Category & Sub-category)
+df = df.with_columns(
+    pl.col("Category").cast(pl.Categorical),
+    pl.col("Sub-category").cast(pl.Categorical)
+)
+
+# Initialize NLTK utilities
+STOPWORDS = set(stopwords.words('english'))
+stemmer = PorterStemmer()
+lemmatizer = WordNetLemmatizer()
+
+# Text Preprocessing Functions
+def clean_text(text):
+    text = text.lower()
+    text = re.sub(r'[^a-zA-Z0-9\s]', '', text)  # Remove special characters
+    return text
+
+def remove_stopwords(text):
+    return " ".join([word for word in text.split() if word not in STOPWORDS])
+
+def stem_text(text):
+    return " ".join([stemmer.stem(word) for word in text.split()])
+
+def lemmatize_text(text):
+    return " ".join([lemmatizer.lemmatize(word) for word in text.split()])
+
+# Apply Preprocessing on Description column
+df = df.filter(pl.col("Description").is_not_null()).with_columns(
+    pl.col("Description").map_elements(clean_text).alias("cleaned_description")
+)
+df = df.with_columns(
+    pl.col("cleaned_description").map_elements(remove_stopwords).alias("no_stopwords_description")
+)
+df = df.with_columns(
+    pl.col("no_stopwords_description").apply(stem_text).alias("stemmed_description"),
+    pl.col("no_stopwords_description").apply(lemmatize_text).alias("lemmatized_description")
+)
+
+# Description Length Analysis & Visualizations (optional)
+df = df.with_columns(
+    pl.col("cleaned_description").str.len_chars().alias("description_length"),
+    pl.col("cleaned_description").str.len_bytes().alias("description_bytes"),
+    pl.col("cleaned_description").str.n_chars().alias("word_count")
+)
+
+plt.figure(figsize=(10, 5))
+sns.histplot(df["description_length"].to_list(), bins=50, kde=True)
+plt.title("Distribution of Description Lengths")
+plt.xlabel("Number of Characters")
+plt.ylabel("Frequency")
+plt.show()
+
+# Word Frequency Analysis & Word Cloud
+def get_word_counts(texts):
+    words = " ".join(texts).lower().split()
+    return Counter(words)
+
+word_counts = get_word_counts(df["cleaned_description"].drop_nulls().to_list())
+
+wordcloud = WordCloud(width=800, height=400, background_color='white').generate_from_frequencies(word_counts)
+plt.figure(figsize=(10, 5))
+plt.imshow(wordcloud, interpolation='bilinear')
+plt.axis("off")
+plt.show()
+
+# Additional visualizations (Category distributions, bigrams, etc.) can be added as needed.
+
+# For training, we'll use the 'cleaned_description' field and use 'Category' as the label.
+# Convert Category to numeric codes.
+df = df.with_columns(pl.col("Category").cat.codes().alias("label"))
+
+# Set a maximum sequence length for tokenization
+maxlen = 128
+
+# ---------------------------
+# OPTION A: Pre-trained Tokenizer + Custom BERT Model
+# ---------------------------
+# In Option A, we use Hugging Face's pretrained BertTokenizerFast.
+# Make sure to install 'transformers' (pip install transformers)
+
+from transformers import BertTokenizerFast
+
+# Load a pretrained tokenizer (e.g., 'bert-base-uncased')
+pretrained_tokenizer = BertTokenizerFast.from_pretrained("bert-base-uncased")
+
+# PyTorch Dataset for Option A
+class CybercrimeDatasetPretrained(Dataset):
+    def __init__(self, df, tokenizer, maxlen):
+        self.descriptions = df["cleaned_description"].to_list()
+        self.labels = df["label"].to_list()
+        self.tokenizer = tokenizer
+        self.maxlen = maxlen
+        
+    def __len__(self):
+        return len(self.descriptions)
+    
+    def __getitem__(self, idx):
+        text = self.descriptions[idx]
+        encoding = self.tokenizer(text,
+                                  add_special_tokens=True,
+                                  padding='max_length',
+                                  truncation=True,
+                                  max_length=self.maxlen,
+                                  return_tensors="pt")
+        # Squeeze to remove extra dimension
+        input_ids = encoding['input_ids'].squeeze(0)
+        token_type_ids = encoding['token_type_ids'].squeeze(0)
+        label = torch.tensor(self.labels[idx], dtype=torch.long)
+        return input_ids, token_type_ids, label
+
+# Custom BERT Model (Option A)
+class CybercrimeBERT(nn.Module):
+    def __init__(self, vocab_size=30522, d_model=512, n_layers=6, n_heads=8, d_ff=2048, n_classes=10):
+        super(CybercrimeBERT, self).__init__()
+        self.embedding = nn.Embedding(vocab_size, d_model)
+        self.positional_encoding = nn.Embedding(maxlen, d_model)
+        self.segment_embedding = nn.Embedding(2, d_model)
+        self.layers = nn.ModuleList([TransformerBlock(d_model, n_heads, d_ff) for _ in range(n_layers)])
+        self.fc = nn.Linear(d_model, n_classes)
+        
+    def forward(self, x, seg):
+        seq_len = x.size(1)
+        pos = torch.arange(seq_len, dtype=torch.long, device=x.device).unsqueeze(0).expand_as(x)
+        x = self.embedding(x) + self.positional_encoding(pos) + self.segment_embedding(seg)
+        attn_mask = (x.sum(dim=-1) == 0).unsqueeze(1).expand(-1, seq_len, seq_len)
+        for layer in self.layers:
+            x = layer(x, attn_mask)
+        x = x[:, 0]  # Use [CLS] token output
+        return self.fc(x)
+
+class TransformerBlock(nn.Module):
+    def __init__(self, d_model, n_heads, d_ff):
+        super(TransformerBlock, self).__init__()
+        self.attention = MultiHeadAttention(d_model, n_heads)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.ffn = FeedForward(d_model, d_ff)
+        self.norm2 = nn.LayerNorm(d_model)
+        
+    def forward(self, x, attn_mask):
+        attn_out = self.attention(x, x, x, attn_mask)
+        x = self.norm1(x + attn_out)
+        ffn_out = self.ffn(x)
+        return self.norm2(x + ffn_out)
+
+class MultiHeadAttention(nn.Module):
+    def __init__(self, d_model, n_heads):
+        super(MultiHeadAttention, self).__init__()
+        self.d_k = d_model // n_heads
+        self.n_heads = n_heads
+        self.qkv_linear = nn.Linear(d_model, self.d_k * n_heads * 3)
+        self.fc = nn.Linear(self.d_k * n_heads, d_model)
+        
+    def forward(self, q, k, v, attn_mask):
+        batch_size = q.size(0)
+        qkv = self.qkv_linear(q).view(batch_size, -1, self.n_heads, 3 * self.d_k).chunk(3, dim=-1)
+        q, k, v = [x.transpose(1, 2) for x in qkv]
+        scores = torch.matmul(q, k.transpose(-2, -1)) / np.sqrt(self.d_k)
+        scores.masked_fill_(attn_mask, -1e9)
+        attn = torch.softmax(scores, dim=-1)
+        context = torch.matmul(attn, v).transpose(1, 2).reshape(batch_size, -1, self.n_heads * self.d_k)
+        return self.fc(context)
+
+class FeedForward(nn.Module):
+    def __init__(self, d_model, d_ff):
+        super(FeedForward, self).__init__()
+        self.fc1 = nn.Linear(d_model, d_ff)
+        self.fc2 = nn.Linear(d_ff, d_model)
+        
+    def forward(self, x):
+        return self.fc2(torch.relu(self.fc1(x)))
+
+# Dataset and DataLoader for Option A
+dataset_a = CybercrimeDatasetPretrained(df, pretrained_tokenizer, maxlen)
+dataloader_a = DataLoader(dataset_a, batch_size=32, shuffle=True)
+
+# Model, Loss, Optimizer for Option A
+model_a = CybercrimeBERT(vocab_size=pretrained_tokenizer.vocab_size, d_model=512, n_layers=6, n_heads=8, d_ff=2048, n_classes=10)
+optimizer_a = optim.Adam(model_a.parameters(), lr=1e-4)
+criterion = nn.CrossEntropyLoss()
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model_a.to(device)
+
+def train_option_a(model, dataloader, epochs=5):
+    model.train()
+    for epoch in range(epochs):
+        total_loss = 0
+        for input_ids, seg_ids, labels in dataloader:
+            input_ids, seg_ids, labels = input_ids.to(device), seg_ids.to(device), labels.to(device)
+            outputs = model(input_ids, seg_ids)
+            loss = criterion(outputs, labels)
+            optimizer_a.zero_grad()
+            loss.backward()
+            optimizer_a.step()
+            total_loss += loss.item()
+        print(f"[Option A] Epoch {epoch+1}/{epochs}, Loss: {total_loss/len(dataloader):.4f}")
+
+# Uncomment to run Option A training:
+# train_option_a(model_a, dataloader_a, epochs=5)
+
+# ---------------------------
+# OPTION B: Custom Tokenizer + Less Intensive Model (LSTM Classifier)
+# ---------------------------
+# In Option B, we use your custom WordPiece tokenizer with a simpler LSTM classifier.
+
+# Custom WordPiece Tokenizer (same as defined earlier)
+class WordPieceTokenizer:
+    def __init__(self, vocab_size=5000):
+        self.vocab_size = vocab_size
+        self.vocab = {}
+        self.merges = {}
+    
+    def train(self, corpus):
+        word_freq = Counter(itertools.chain(*[sentence.split() for sentence in corpus]))
+        vocab = {word: list(word) + ["</w>"] for word in word_freq}
+        merges = {}
+        while len(vocab) < self.vocab_size:
+            bigram_counts = Counter()
+            for word, symbols in vocab.items():
+                for i in range(len(symbols) - 1):
+                    bigram_counts[(symbols[i], symbols[i + 1])] += word_freq[word]
+            if not bigram_counts:
+                break
+            best_pair = max(bigram_counts, key=bigram_counts.get)
+            merges[best_pair] = "".join(best_pair)
+            for word in vocab:
+                vocab[word] = self.merge_tokens(vocab[word], best_pair)
+        self.vocab = {word: i for i, word in enumerate(set(sum(vocab.values(), [])))} 
+        self.merges = merges
+    
+    def merge_tokens(self, token_list, merge_pair):
+        i = 0
+        while i < len(token_list) - 1:
+            if (token_list[i], token_list[i + 1]) == merge_pair:
+                token_list = token_list[:i] + ["".join(merge_pair)] + token_list[i + 2:]
+            else:
+                i += 1
+        return token_list
+    
+    def tokenize(self, text):
+        words = text.split()
+        tokenized_output = []
+        for word in words:
+            subwords = list(word)
+            for merge_pair, merge_token in self.merges.items():
+                subwords = self.merge_tokens(subwords, merge_pair)
+            tokenized_output.extend(subwords if subwords else ["[UNK]"])
+        return tokenized_output
+
+    def convert_tokens_to_ids(self, tokens):
+        return [self.vocab.get(token, self.vocab.get("[UNK]", -1)) for token in tokens]
+
+# Initialize and train the custom tokenizer on the cleaned descriptions
+custom_tokenizer = WordPieceTokenizer(vocab_size=5000)
+custom_corpus = df["cleaned_description"].drop_nulls().to_list()
+custom_tokenizer.train(custom_corpus)
+
+def preprocess_text_custom(text):
+    tokens = custom_tokenizer.tokenize(text)
+    token_ids = custom_tokenizer.convert_tokens_to_ids(tokens)
+    if len(token_ids) < maxlen:
+        token_ids += [0] * (maxlen - len(token_ids))
+    else:
+        token_ids = token_ids[:maxlen]
+    return torch.tensor(token_ids, dtype=torch.long)
+
+# Simple LSTM Classifier for Option B
+class LSTMClassifier(nn.Module):
+    def __init__(self, vocab_size, embed_dim=128, hidden_dim=128, n_classes=10):
+        super(LSTMClassifier, self).__init__()
+        self.embedding = nn.Embedding(vocab_size, embed_dim)
+        self.lstm = nn.LSTM(embed_dim, hidden_dim, batch_first=True, bidirectional=True)
+        self.fc = nn.Linear(hidden_dim * 2, n_classes)
+        
+    def forward(self, x):
+        x = self.embedding(x)
+        lstm_out, _ = self.lstm(x)
+        # Use the final hidden state from both directions
+        out = lstm_out[:, -1, :]
+        return self.fc(out)
+
+# PyTorch Dataset for Option B
+class CybercrimeDatasetCustom(Dataset):
+    def __init__(self, df):
+        self.descriptions = df["cleaned_description"].to_list()
+        self.labels = df["label"].to_list()
+        
+    def __len__(self):
+        return len(self.descriptions)
+    
+    def __getitem__(self, idx):
+        text = self.descriptions[idx]
+        input_ids = preprocess_text_custom(text)
+        if input_ids.size(0) < maxlen:
+            padding = torch.zeros(maxlen - input_ids.size(0), dtype=torch.long)
+            input_ids = torch.cat((input_ids, padding), dim=0)
+        else:
+            input_ids = input_ids[:maxlen]
+        label = torch.tensor(self.labels[idx], dtype=torch.long)
+        return input_ids, label
+
+dataset_b = CybercrimeDatasetCustom(df)
+dataloader_b = DataLoader(dataset_b, batch_size=32, shuffle=True)
+
+# Model, Loss, Optimizer for Option B
+model_b = LSTMClassifier(vocab_size=5000, embed_dim=128, hidden_dim=128, n_classes=10)
+optimizer_b = optim.Adam(model_b.parameters(), lr=1e-3)
+criterion_b = nn.CrossEntropyLoss()
+
+model_b.to(device)
+
+def train_option_b(model, dataloader, epochs=5):
+    model.train()
+    for epoch in range(epochs):
+        total_loss = 0
+        for input_ids, labels in dataloader:
+            input_ids, labels = input_ids.to(device), labels.to(device)
+            outputs = model(input_ids)
+            loss = criterion_b(outputs, labels)
+            optimizer_b.zero_grad()
+            loss.backward()
+            optimizer_b.step()
+            total_loss += loss.item()
+        print(f"[Option B] Epoch {epoch+1}/{epochs}, Loss: {total_loss/len(dataloader):.4f}")
+
+# Uncomment to run Option B training:
+# train_option_b(model_b, dataloader_b, epochs=5)
+
+# ---------------------------
+# Example Inference for Both Options
+# ---------------------------
+# Option A Inference (Pretrained Tokenizer + Custom BERT)
+example_text = "Cybercrime fraud detection system report sample"
+encoding = pretrained_tokenizer(example_text,
+                                add_special_tokens=True,
+                                padding='max_length',
+                                truncation=True,
+                                max_length=maxlen,
+                                return_tensors="pt")
+input_ids_a = encoding['input_ids'].to(device)
+seg_ids_a = encoding['token_type_ids'].to(device)
+model_a.eval()
+with torch.no_grad():
+    outputs_a = model_a(input_ids_a, seg_ids_a)
+    predicted_class_a = torch.argmax(outputs_a, dim=1).item()
+    print(f"[Option A] Predicted Class: {predicted_class_a}")
+
+# Option B Inference (Custom Tokenizer + LSTM Classifier)
+input_ids_b = preprocess_text_custom(example_text).unsqueeze(0).to(device)
+model_b.eval()
+with torch.no_grad():
+    outputs_b = model_b(input_ids_b)
+    predicted_class_b = torch.argmax(outputs_b, dim=1).item()
+    print(f"[Option B] Predicted Class: {predicted_class_b}")
