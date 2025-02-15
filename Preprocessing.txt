@@ -1,0 +1,42 @@
+import polars as pl
+import re
+import nltk
+from nltk.corpus import stopwords
+from nltk.stem import PorterStemmer, WordNetLemmatizer
+
+
+nltk.download('stopwords')
+nltk.download('wordnet')
+nltk.download('omw-1.4')
+
+
+STOPWORDS = set(stopwords.words('english'))
+stemmer = PorterStemmer()
+lemmatizer = WordNetLemmatizer()
+
+# Text Preprocessing Functions
+def clean_text(text):
+    text = text.lower()
+    text = re.sub(r'[^a-zA-Z0-9\s]', '', text)  
+    return text
+
+def remove_stopwords(text):
+    return " ".join([word for word in text.split() if word not in STOPWORDS])
+
+def stem_text(text):
+    return " ".join([stemmer.stem(word) for word in text.split()])
+
+def lemmatize_text(text):
+    return " ".join([lemmatizer.lemmatize(word) for word in text.split()])
+
+# Apply Preprocessing
+df = df.with_columns(
+    pl.col("Description").drop_nulls().map_elements(clean_text).alias("cleaned_description")
+)
+df = df.with_columns(
+    pl.col("cleaned_description").map_elements(remove_stopwords).alias("no_stopwords_description")
+)
+df = df.with_columns(
+    pl.col("no_stopwords_description").map_elements(stem_text).alias("stemmed_description"),
+    pl.col("no_stopwords_description").map_elements(lemmatize_text).alias("lemmatized_description")
+)
